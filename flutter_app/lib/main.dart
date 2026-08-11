@@ -20,13 +20,21 @@ class BackendConfig {
   static String baseUrl = kAndroidEmulator;
 
   static String get chatEndpoint => "$baseUrl/chat";
+  static String get sessionsEndpoint => "$baseUrl/sessions";
 }
 
 // ---------------------------------------------------------------------------
-// App — uses AppTheme from theme.dart (design tokens + a11y labels)
+// App with Navigation State
 // ---------------------------------------------------------------------------
-class AIChatApp extends StatelessWidget {
+class AIChatApp extends StatefulWidget {
   const AIChatApp({super.key});
+
+  @override
+  State<AIChatApp> createState() => _AIChatAppState();
+}
+
+class _AIChatAppState extends State<AIChatApp> {
+  String? _activeSessionId;
 
   @override
   Widget build(BuildContext context) {
@@ -35,10 +43,18 @@ class AIChatApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light(),
       darkTheme: AppTheme.dark(),
-      home: Semantics(
-        label: 'AI Chat conversation screen',
-        child: const ChatScreen(),
-      ),
+      home: _activeSessionId == null
+          ? SessionListScreen(
+              onSelectSession: (sessionId) {
+                setState(() => _activeSessionId = sessionId);
+              },
+            )
+          : ChatScreen(
+              sessionId: _activeSessionId,
+              onBack: () {
+                setState(() => _activeSessionId = null);
+              },
+            ),
     );
   }
 }
@@ -66,11 +82,303 @@ class ChatMessage {
   }) : timestamp = timestamp ?? DateTime.now();
 }
 
+class Session {
+  final String sessionId;
+  final String title;
+  final DateTime createdAt;
+  final int messageCount;
+
+  Session({
+    required this.sessionId,
+    required this.title,
+    required this.createdAt,
+    this.messageCount = 0,
+  });
+
+  factory Session.fromJson(Map<String, dynamic> json) {
+    return Session(
+      sessionId: json['session_id'] ?? '',
+      title: json['title'] ?? 'Chat',
+      createdAt: DateTime.tryParse(json['created_at'] ?? '') ?? DateTime.now(),
+      messageCount: json['message_count'] ?? 0,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session List Screen (with create new session)
+// ---------------------------------------------------------------------------
+class SessionListScreen extends StatefulWidget {
+  final Function(String) onSelectSession;
+
+  const SessionListScreen({
+    super.key,
+    required this.onSelectSession,
+  });
+
+  @override
+  State<SessionListScreen> createState() => _SessionListScreenState();
+}
+
+class _SessionListScreenState extends State<SessionListScreen> {
+  late Future<List<Session>> _sessionsFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _sessionsFuture = _fetchSessions();
+  }
+
+  Future<List<Session>> _fetchSessions() async {
+    try {
+      final response = await http.get(
+        Uri.parse(BackendConfig.sessionsEndpoint),
+      ).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as List;
+        return data.map((s) => Session.fromJson(s)).toList();
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Failed to load sessions: $e")),
+        );
+      }
+    }
+    return [];
+  }
+
+  Future<void> _createNewSession() async {
+    final titleController = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("New Chat Session"),
+        content: TextField(
+          controller: titleController,
+          autofocus: true,
+          decoration: const InputDecoration(
+            hintText: "Enter session title...",
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("Cancel"),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(ctx, titleController.text.trim().isNotEmpty ? titleController.text.trim() : "New Chat"),
+            child: const Text("Create"),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null) {
+      try {
+        final response = await http.post(
+          Uri.parse(BackendConfig.sessionsEndpoint),
+          headers: {"Content-Type": "application/json"},
+          body: jsonEncode({"title": result}),
+        ).timeout(const Duration(seconds: 10));
+
+        if (response.statusCode == 201) {
+          final data = jsonDecode(response.body);
+          if (mounted) {
+            widget.onSelectSession(data['session_id']);
+          }
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Failed to create session: $e")),
+          );
+        }
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("AI Chat Sessions"),
+        centerTitle: true,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings_outlined),
+            tooltip: "Backend settings",
+            onPressed: _showSettings,
+          ),
+        ],
+      ),
+      body: FutureBuilder<List<Session>>(
+        future: _sessionsFuture,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          if (snapshot.hasError) {
+            return Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.error_outline, size: 48, color: Colors.red),
+                  const SizedBox(height: 16),
+                  Text("Error: ${snapshot.error}"),
+                  const SizedBox(height: 16),
+                  FilledButton.tonal(
+                    onPressed: () {
+                      setState(() {
+                        _sessionsFuture = _fetchSessions();
+                      });
+                    },
+                    child: const Text("Retry"),
+                  ),
+                ],
+              ),
+            );
+          }
+
+          final sessions = snapshot.data ?? [];
+
+          return Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: FilledButton.icon(
+                  onPressed: _createNewSession,
+                  icon: const Icon(Icons.add),
+                  label: const Text("New Chat"),
+                ),
+              ),
+              if (sessions.isEmpty)
+                const Expanded(
+                  child: Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.chat_bubble_outline, size: 48, color: Colors.grey),
+                        SizedBox(height: 16),
+                        Text("No sessions yet. Create one to start!"),
+                      ],
+                    ),
+                  ),
+                )
+              else
+                Expanded(
+                  child: ListView.builder(
+                    itemCount: sessions.length,
+                    itemBuilder: (context, index) {
+                      final session = sessions[index];
+                      return Card(
+                        margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        child: ListTile(
+                          title: Text(session.title),
+                          subtitle: Text(
+                            "${session.messageCount} messages • ${_formatDate(session.createdAt)}",
+                          ),
+                          trailing: const Icon(Icons.chevron_right),
+                          onTap: () => widget.onSelectSession(session.sessionId),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  String _formatDate(DateTime date) {
+    final now = DateTime.now();
+    if (date.year == now.year &&
+        date.month == now.month &&
+        date.day == now.day) {
+      return "Today ${date.hour}:${date.minute.toString().padLeft(2, '0')}";
+    }
+    return "${date.month}/${date.day}/${date.year}";
+  }
+
+  Future<void> _showSettings() async {
+    final controller = TextEditingController(text: BackendConfig.baseUrl);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("Backend URL"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text("Enter the base URL of your FastAPI backend:"),
+            const SizedBox(height: 16),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              decoration: const InputDecoration(
+                hintText: "http://localhost:8000",
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                ActionChip(
+                  label: const Text("Android Emulator"),
+                  onPressed: () => controller.text = BackendConfig.kAndroidEmulator,
+                ),
+                ActionChip(
+                  label: const Text("Localhost"),
+                  onPressed: () => controller.text = BackendConfig.kLocalhost,
+                ),
+              ],
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("Cancel"),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text("Save"),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null && result.isNotEmpty) {
+      BackendConfig.baseUrl = result.replaceFirst(RegExp(r'/$'), '');
+      if (mounted) {
+        setState(() {
+          _sessionsFuture = _fetchSessions();
+        });
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Chat Screen
 // ---------------------------------------------------------------------------
 class ChatScreen extends StatefulWidget {
-  const ChatScreen({super.key});
+  final String? sessionId;
+  final VoidCallback? onBack;
+
+  const ChatScreen({
+    super.key,
+    this.sessionId,
+    this.onBack,
+  });
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -111,8 +419,8 @@ class _ChatScreenState extends State<ChatScreen> {
       if (pos.pixels < target - 50 || force) {
         _scrollController.animateTo(
           target,
-          duration: AppDurations.medium,
-          curve: AppCurves.enter,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
         );
       }
     });
@@ -121,7 +429,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void _insertMessage(ChatMessage msg) {
     _messages.add(msg);
     final idx = _messages.length - 1;
-    _listKey.currentState?.insertItem(idx, duration: AppDurations.medium);
+    _listKey.currentState?.insertItem(idx, duration: const Duration(milliseconds: 300));
     _scrollToBottom();
   }
 
@@ -145,11 +453,17 @@ class _ChatScreenState extends State<ChatScreen> {
               })
           .toList(growable: false);
 
+      final body = {
+        "message": text,
+        "history": history,
+        if (widget.sessionId != null) "session_id": widget.sessionId,
+      };
+
       final response = await http
           .post(
             Uri.parse(BackendConfig.chatEndpoint),
             headers: {"Content-Type": "application/json"},
-            body: jsonEncode({"message": text, "history": history}),
+            body: jsonEncode(body),
           )
           .timeout(const Duration(seconds: 120));
 
@@ -190,44 +504,49 @@ class _ChatScreenState extends State<ChatScreen> {
     final controller = TextEditingController(text: BackendConfig.baseUrl);
     final result = await showDialog<String>(
       context: context,
-      builder: (ctx) => Semantics(
-        label: 'Backend settings dialog',
-        child: AlertDialog(
-          title: const Text("Backend URL"),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text("Enter the base URL of your FastAPI backend:"),
-              const SizedBox(height: AppSpacing.md),
-              TextField(
-                controller: controller,
-                autofocus: true,
-                decoration: const InputDecoration(
-                  hintText: "http://localhost:8000",
-                  border: OutlineInputBorder(),
+      builder: (ctx) => AlertDialog(
+        title: const Text("Backend URL"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text("Enter the base URL of your FastAPI backend:"),
+            const SizedBox(height: 16),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              decoration: const InputDecoration(
+                hintText: "http://localhost:8000",
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                ActionChip(
+                  label: const Text("Android Emulator"),
+                  onPressed: () => controller.text = BackendConfig.kAndroidEmulator,
                 ),
-              ),
-              const SizedBox(height: AppSpacing.md),
-              Wrap(
-                spacing: AppSpacing.sm,
-                runSpacing: AppSpacing.sm,
-                children: [
-                  _presetChip("Android Emulator", BackendConfig.kAndroidEmulator, controller),
-                  _presetChip("Localhost", BackendConfig.kLocalhost, controller),
-                ],
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text("Cancel")),
-            FilledButton(
-                onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-                child: const Text("Save")),
+                ActionChip(
+                  label: const Text("Localhost"),
+                  onPressed: () => controller.text = BackendConfig.kLocalhost,
+                ),
+              ],
+            ),
           ],
         ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("Cancel"),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text("Save"),
+          ),
+        ],
       ),
     );
     if (result != null && result.isNotEmpty) {
@@ -242,14 +561,6 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Widget _presetChip(
-          String label, String value, TextEditingController target) =>
-      ActionChip(
-        label: Text(label),
-        tooltip: "Set URL to $value",
-        onPressed: () => target.text = value,
-      );
-
   Future<void> _clearChat() async {
     final ok = await showDialog<bool>(
       context: context,
@@ -258,13 +569,16 @@ class _ChatScreenState extends State<ChatScreen> {
         content: const Text("All messages in this conversation will be removed."),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text("Cancel")),
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text("Cancel"),
+          ),
           FilledButton(
-              style: FilledButton.styleFrom(
-                  backgroundColor: Theme.of(ctx).colorScheme.error),
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text("Clear")),
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text("Clear"),
+          ),
         ],
       ),
     );
@@ -274,11 +588,11 @@ class _ChatScreenState extends State<ChatScreen> {
       _listKey.currentState?.removeItem(
         lastIdx,
         (context, animation) => const SizedBox.shrink(),
-        duration: AppDurations.fast,
+        duration: const Duration(milliseconds: 150),
       );
       _messages.removeAt(lastIdx);
     }
-    await Future<void>.delayed(AppDurations.fast);
+    await Future<void>.delayed(const Duration(milliseconds: 150));
     if (mounted) {
       _insertMessage(ChatMessage(
         text: "Chat cleared. How can I help?",
@@ -291,25 +605,23 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        leading: widget.onBack != null
+            ? IconButton(
+                icon: const Icon(Icons.arrow_back),
+                onPressed: widget.onBack,
+              )
+            : null,
         title: const Text("AI Chat"),
         actions: [
-          Semantics(
-            label: AppSemantics.clearButton,
-            button: true,
-            child: IconButton(
-              tooltip: "Clear chat",
-              icon: const Icon(Icons.delete_sweep_outlined),
-              onPressed: _clearChat,
-            ),
+          IconButton(
+            tooltip: "Clear chat",
+            icon: const Icon(Icons.delete_sweep_outlined),
+            onPressed: _clearChat,
           ),
-          Semantics(
-            label: AppSemantics.settingsButton,
-            button: true,
-            child: IconButton(
-              tooltip: "Backend settings",
-              icon: const Icon(Icons.settings_outlined),
-              onPressed: _showSettings,
-            ),
+          IconButton(
+            tooltip: "Backend settings",
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: _showSettings,
           ),
         ],
       ),
@@ -317,17 +629,13 @@ class _ChatScreenState extends State<ChatScreen> {
         children: [
           Expanded(
             child: _messages.isEmpty
-                ? Center(
-                    child: Semantics(
-                      label: 'No messages yet placeholder',
-                      child: const Text("No messages yet",
-                          style: TextStyle(color: Colors.grey)),
-                    ),
+                ? const Center(
+                    child: Text("No messages yet", style: TextStyle(color: Colors.grey)),
                   )
                 : AnimatedList(
                     key: _listKey,
                     controller: _scrollController,
-                    padding: const EdgeInsets.all(AppSpacing.md),
+                    padding: const EdgeInsets.all(16),
                     initialItemCount: _messages.length,
                     itemBuilder: (context, index, animation) =>
                         _AnimatedMessageBubble(
@@ -336,38 +644,26 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
                   ),
           ),
-          AnimatedSize(
-            duration: AppDurations.fast,
-            curve: AppCurves.standard,
-            child: _isLoading ? const _TypingIndicator() : const SizedBox.shrink(),
-          ),
+          if (_isLoading) const _TypingIndicator(),
           Padding(
-            padding: const EdgeInsets.fromLTRB(AppSpacing.md, AppSpacing.sm, AppSpacing.sm, AppSpacing.xl),
+            padding: const EdgeInsets.fromLTRB(16, 8, 8, 24),
             child: Row(
               children: [
                 Expanded(
-                  child: Semantics(
-                    label: AppSemantics.messageField,
-                    textField: true,
-                    child: TextField(
-                      controller: _controller,
-                      textInputAction: TextInputAction.send,
-                      minLines: 1,
-                      maxLines: 4,
-                      decoration: InputDecoration(
-                        hintText: "Type a message…",
-                        suffixIcon: Semantics(
-                          label: AppSemantics.sendButton,
-                          button: true,
-                          child: IconButton(
-                            tooltip: "Send",
-                            icon: const Icon(Icons.send_rounded),
-                            onPressed: _isLoading ? null : _sendMessage,
-                          ),
-                        ),
+                  child: TextField(
+                    controller: _controller,
+                    textInputAction: TextInputAction.send,
+                    minLines: 1,
+                    maxLines: 4,
+                    decoration: InputDecoration(
+                      hintText: "Type a message…",
+                      suffixIcon: IconButton(
+                        tooltip: "Send",
+                        icon: const Icon(Icons.send_rounded),
+                        onPressed: _isLoading ? null : _sendMessage,
                       ),
-                      onSubmitted: (_) => _sendMessage(),
                     ),
+                    onSubmitted: (_) => _sendMessage(),
                   ),
                 ),
               ],
@@ -380,7 +676,7 @@ class _ChatScreenState extends State<ChatScreen> {
 }
 
 // ---------------------------------------------------------------------------
-// Animated message bubble (fade + slide in)
+// Animated Message Bubble with Sentiment Badge
 // ---------------------------------------------------------------------------
 class _AnimatedMessageBubble extends StatelessWidget {
   final ChatMessage message;
@@ -396,11 +692,12 @@ class _AnimatedMessageBubble extends StatelessWidget {
     final slide = Tween<Offset>(
       begin: Offset(message.isUser ? 0.25 : -0.25, 0.08),
       end: Offset.zero,
-    ).chain(CurveTween(curve: AppCurves.enter));
+    ).chain(CurveTween(curve: Curves.easeOut));
+
     return SlideTransition(
       position: animation.drive(slide),
       child: FadeTransition(
-        opacity: CurvedAnimation(parent: animation, curve: AppCurves.enter),
+        opacity: CurvedAnimation(parent: animation, curve: Curves.easeOut),
         child: _MessageBubble(message: message),
       ),
     );
@@ -408,7 +705,7 @@ class _AnimatedMessageBubble extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Message Bubble
+// Message Bubble with Sentiment and Metadata
 // ---------------------------------------------------------------------------
 class _MessageBubble extends StatelessWidget {
   final ChatMessage message;
@@ -440,282 +737,152 @@ class _MessageBubble extends StatelessWidget {
     final fg = isUser
         ? theme.colorScheme.onPrimaryContainer
         : theme.colorScheme.onSurfaceVariant;
-    final preview = message.text.replaceAll('\n', ' ').length > 80
-        ? message.text.replaceAll('\n', ' ').substring(0, 80)
-        : message.text.replaceAll('\n', ' ');
 
     return Align(
       alignment: align,
       child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 3),
-        child: Semantics(
-          label: isUser
-              ? AppSemantics.userMessage(preview)
-              : AppSemantics.aiMessage(preview),
-          onLongPressHint: 'Copy message',
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              if (!isUser) ...[
-                _Avatar(isUser: false),
-                const SizedBox(width: AppSpacing.sm),
-              ],
-              Flexible(
-                child: InkWell(
-                  borderRadius: BorderRadius.only(
-                    topLeft: const Radius.circular(AppRadius.bubble),
-                    topRight: const Radius.circular(AppRadius.bubble),
-                    bottomLeft: Radius.circular(isUser ? AppRadius.bubble : AppRadius.small),
-                    bottomRight: Radius.circular(isUser ? AppRadius.small : AppRadius.bubble),
-                  ),
-                  onLongPress: () => _copy(context, message.text),
-                  child: Tooltip(
-                    message: "Long-press to copy",
-                    preferBelow: false,
-                    child: Container(
-                      constraints: BoxConstraints(
-                        maxWidth: MediaQuery.of(context).size.width * 0.78,
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            if (!isUser) const SizedBox(width: 8),
+            Flexible(
+              child: GestureDetector(
+                onLongPress: () => _copy(context, message.text),
+                child: Tooltip(
+                  message: "Long-press to copy",
+                  preferBelow: false,
+                  child: Container(
+                    constraints: BoxConstraints(
+                      maxWidth: MediaQuery.of(context).size.width * 0.78,
+                    ),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    decoration: BoxDecoration(
+                      color: bg,
+                      borderRadius: BorderRadius.only(
+                        topLeft: const Radius.circular(16),
+                        topRight: const Radius.circular(16),
+                        bottomLeft: Radius.circular(isUser ? 16 : 4),
+                        bottomRight: Radius.circular(isUser ? 4 : 16),
                       ),
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: AppSpacing.md, vertical: AppSpacing.sm + 2),
-                      decoration: BoxDecoration(
-                        color: bg,
-                        borderRadius: BorderRadius.only(
-                          topLeft: const Radius.circular(AppRadius.bubble),
-                          topRight: const Radius.circular(AppRadius.bubble),
-                          bottomLeft: Radius.circular(isUser ? AppRadius.bubble : AppRadius.small),
-                          bottomRight: Radius.circular(isUser ? AppRadius.small : AppRadius.bubble),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        SelectableText(
+                          message.text,
+                          style: TextStyle(color: fg),
                         ),
-                      ),
-                      child: DefaultTextStyle(
-                        style: AppTextStyles.bubbleBody.copyWith(color: fg),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                        const SizedBox(height: 8),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
                           children: [
-                            if (isUser)
-                              SelectableText(message.text)
-                            else
-                              _MarkdownBody(text: message.text, fg: fg),
-                            const SizedBox(height: AppSpacing.sm - 2),
-                            Wrap(
-                              spacing: AppSpacing.sm,
-                              runSpacing: AppSpacing.xs,
-                              crossAxisAlignment: WrapCrossAlignment.center,
-                              children: [
-                                Text(
-                                  _time(message.timestamp),
-                                  style: AppTextStyles.bubbleMeta
-                                      .copyWith(color: fg.withValues(alpha: 0.6)),
-                                ),
-                                if (message.sentiment != null)
-                                  _SentimentChip(
-                                    label: message.sentiment!,
-                                    confidence: message.confidence,
-                                  ),
-                                if (message.provider != null)
-                                  _Badge(
-                                      text: message.provider!,
-                                      fg: fg,
-                                      fontWeight: FontWeight.w800,
-                                      backgroundAlpha: 0.14),
-                                if (message.model != null)
-                                  _Badge(
-                                      text: message.model!,
-                                      fg: fg,
-                                      backgroundAlpha: 0.08),
-                              ],
+                            // Sentiment Badge
+                            if (!isUser && message.sentiment != null)
+                              _SentimentBadge(
+                                label: message.sentiment!,
+                                confidence: message.confidence ?? 0.0,
+                              ),
+                            if (!isUser && message.sentiment != null)
+                              const SizedBox(width: 6),
+                            // Time
+                            Text(
+                              _formatTime(message.timestamp),
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: fg.withAlpha(180),
+                              ),
                             ),
                           ],
                         ),
-                      ),
+                        // Provider info
+                        if (!isUser && message.provider != null) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            "${message.provider} • ${message.model}",
+                            style: TextStyle(
+                              fontSize: 10,
+                              color: fg.withAlpha(140),
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
                   ),
                 ),
               ),
-              if (isUser) ...[
-                const SizedBox(width: AppSpacing.sm),
-                _Avatar(isUser: true),
-              ],
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  String _time(DateTime t) {
-    final h = t.hour.toString().padLeft(2, '0');
-    final m = t.minute.toString().padLeft(2, '0');
-    return "$h:$m";
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Small widgets
-// ---------------------------------------------------------------------------
-class _Avatar extends StatelessWidget {
-  final bool isUser;
-
-  const _Avatar({required this.isUser});
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final color = isUser ? theme.colorScheme.secondaryContainer : theme.colorScheme.primary;
-    final onColor = isUser ? theme.colorScheme.onSecondaryContainer : theme.colorScheme.onPrimary;
-    return Semantics(
-      label: isUser ? AppSemantics.userAvatar : AppSemantics.aiAvatar,
-      child: CircleAvatar(
-        radius: 16,
-        backgroundColor: color,
-        child: Icon(
-          isUser ? Icons.person_outline : Icons.smart_toy_outlined,
-          color: onColor,
-          size: 18,
-        ),
-      ),
-    );
-  }
-}
-
-class _Badge extends StatelessWidget {
-  final String text;
-  final Color fg;
-  final FontWeight fontWeight;
-  final double backgroundAlpha;
-
-  const _Badge({
-    required this.text,
-    required this.fg,
-    this.fontWeight = FontWeight.w600,
-    this.backgroundAlpha = 0.08,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(
-          horizontal: AppSpacing.xs + 2, vertical: 2),
-      decoration: BoxDecoration(
-        color: fg.withValues(alpha: backgroundAlpha),
-        borderRadius: BorderRadius.circular(AppRadius.badge),
-      ),
-      child: Text(
-        text,
-        style: TextStyle(
-          fontSize: 10,
-          color: fg.withValues(alpha: 0.85),
-          fontWeight: fontWeight,
-        ),
-      ),
-    );
-  }
-}
-
-class _SentimentChip extends StatelessWidget {
-  final String label;
-  final double? confidence;
-
-  const _SentimentChip({required this.label, this.confidence});
-
-  @override
-  Widget build(BuildContext context) {
-    final positive = label.toUpperCase().contains("POSITIVE");
-    final color = positive ? AppColors.positive : AppColors.negative;
-    final icon = positive
-        ? Icons.sentiment_satisfied_alt
-        : Icons.sentiment_dissatisfied;
-    final pct = confidence == null
-        ? ""
-        : " ${(confidence! * 100).toStringAsFixed(0)}%";
-    return Semantics(
-      label: 'Sentiment: $label ${pct.trim()}',
-      child: Container(
-        padding: const EdgeInsets.symmetric(
-            horizontal: AppSpacing.xs + 2, vertical: 2),
-        decoration: BoxDecoration(
-          color: color.withValues(alpha: 0.1),
-          borderRadius: BorderRadius.circular(AppRadius.badge),
-          border: Border.all(color: color.withValues(alpha: 0.25)),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 12, color: color),
-            const SizedBox(width: 3),
-            Text(
-              "${label.toLowerCase()}$pct",
-              style: TextStyle(
-                  fontSize: 10, color: color, fontWeight: FontWeight.w700),
             ),
+            if (isUser) const SizedBox(width: 8),
           ],
         ),
       ),
     );
   }
+
+  String _formatTime(DateTime time) {
+    return "${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}";
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Markdown rendering (only for AI replies, users get plain text)
+// Sentiment Badge (Colored indicator)
 // ---------------------------------------------------------------------------
-class _MarkdownBody extends StatelessWidget {
-  final String text;
-  final Color fg;
+class _SentimentBadge extends StatelessWidget {
+  final String label;
+  final double confidence;
 
-  const _MarkdownBody({required this.text, required this.fg});
+  const _SentimentBadge({
+    required this.label,
+    required this.confidence,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return MarkdownBody(
-      data: text,
-      selectable: true,
-      softLineBreak: true,
-      extensionSet: md.ExtensionSet.gitHubFlavored,
-      styleSheet: MarkdownStyleSheet(
-        p: AppTextStyles.bubbleBody.copyWith(color: fg, height: 1.35),
-        h1: TextStyle(
-            color: fg, fontSize: 20, fontWeight: FontWeight.w800, height: 1.25),
-        h2: TextStyle(
-            color: fg, fontSize: 18, fontWeight: FontWeight.w700, height: 1.25),
-        h3: TextStyle(
-            color: fg, fontSize: 16, fontWeight: FontWeight.w700, height: 1.25),
-        strong: TextStyle(fontWeight: FontWeight.w800, color: fg),
-        em: TextStyle(fontStyle: FontStyle.italic, color: fg),
-        code: TextStyle(
-          fontFamily: 'monospace',
-          fontSize: 13,
-          color: fg,
-          backgroundColor: fg.withValues(alpha: 0.1),
-        ),
-        codeblockDecoration: BoxDecoration(
-          color: theme.colorScheme.surface,
-          borderRadius: BorderRadius.circular(AppRadius.small),
-          border: Border.all(color: fg.withValues(alpha: 0.15)),
-        ),
-        blockquoteDecoration: BoxDecoration(
-          color: fg.withValues(alpha: 0.06),
-          borderRadius: BorderRadius.circular(AppRadius.xs),
-          border: Border(
-            left: BorderSide(width: 3, color: fg.withValues(alpha: 0.4)),
+    Color badgeColor;
+    IconData icon;
+
+    final upperLabel = label.toUpperCase();
+    if (upperLabel.contains("POSITIVE")) {
+      badgeColor = Colors.green;
+      icon = Icons.thumb_up_rounded;
+    } else if (upperLabel.contains("NEGATIVE")) {
+      badgeColor = Colors.red;
+      icon = Icons.thumb_down_rounded;
+    } else {
+      badgeColor = Colors.grey;
+      icon = Icons.remove_circle_rounded;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: badgeColor.withAlpha(30),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: badgeColor.withAlpha(100), width: 1),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 12, color: badgeColor),
+          const SizedBox(width: 4),
+          Text(
+            "${upperLabel.substring(0, 3)} ${(confidence * 100).toStringAsFixed(0)}%",
+            style: TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.w600,
+              color: badgeColor,
+            ),
           ),
-        ),
-        listBullet: TextStyle(color: fg, fontSize: 15),
-        horizontalRuleDecoration: BoxDecoration(
-          border: Border.all(width: 1, color: fg.withValues(alpha: 0.2)),
-        ),
-        a: TextStyle(
-          color: theme.colorScheme.primary,
-          decoration: TextDecoration.underline,
-        ),
+        ],
       ),
     );
   }
 }
 
 // ---------------------------------------------------------------------------
-// Animated typing indicator (bouncing dots)
+// Typing Indicator (AI is typing...)
 // ---------------------------------------------------------------------------
 class _TypingIndicator extends StatefulWidget {
   const _TypingIndicator();
@@ -731,7 +898,7 @@ class _TypingIndicatorState extends State<_TypingIndicator>
   @override
   void initState() {
     super.initState();
-    _ctrl = AnimationController(vsync: this, duration: AppDurations.typingDot)
+    _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 600))
       ..repeat();
   }
 
@@ -743,81 +910,54 @@ class _TypingIndicatorState extends State<_TypingIndicator>
 
   @override
   Widget build(BuildContext context) {
-    final fg = Theme.of(context).colorScheme.onSurfaceVariant;
+    final theme = Theme.of(context);
     return Padding(
-      padding: const EdgeInsets.symmetric(
-          vertical: AppSpacing.sm, horizontal: AppSpacing.md),
-      child: Semantics(
-        label: AppSemantics.typingIndicator,
-        liveRegion: true,
-        child: Row(
-          children: [
-            const SizedBox(width: AppSpacing.xl),
-            Container(
-              padding: const EdgeInsets.symmetric(
-                  horizontal: AppSpacing.md, vertical: AppSpacing.sm + 2),
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                borderRadius: const BorderRadius.only(
-                  topLeft: Radius.circular(AppRadius.bubble),
-                  topRight: Radius.circular(AppRadius.bubble),
-                  bottomLeft: Radius.circular(AppRadius.small),
-                  bottomRight: Radius.circular(AppRadius.bubble),
-                ),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _dot(0, fg),
-                  const SizedBox(width: 4),
-                  _dot(1, fg),
-                  const SizedBox(width: 4),
-                  _dot(2, fg),
-                  const SizedBox(width: 10),
-                  Text(
-                    "typing…",
-                    style: AppTextStyles.typingHint.copyWith(
-                      color: fg.withValues(alpha: 0.7),
-                    ),
-                  ),
-                ],
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+      child: Row(
+        children: [
+          const SizedBox(width: 40),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHighest,
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(16),
+                topRight: Radius.circular(16),
+                bottomLeft: Radius.circular(4),
+                bottomRight: Radius.circular(16),
               ),
             ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _dot(int i, Color fg) {
-    const delayPerDot = 0.16;
-    final anim = TweenSequence<double>([
-      TweenSequenceItem(
-          tween: Tween(begin: 0, end: -6)
-              .chain(CurveTween(curve: AppCurves.enter)),
-          weight: 30),
-      TweenSequenceItem(
-          tween: Tween(begin: -6, end: 0)
-              .chain(CurveTween(curve: AppCurves.exit)),
-          weight: 30),
-      TweenSequenceItem(tween: ConstantTween(0), weight: 40),
-    ]).animate(CurvedAnimation(
-      parent: _ctrl,
-      curve: Interval(delayPerDot * i, delayPerDot * i + 0.6,
-          curve: Curves.linear),
-    ));
-    return AnimatedBuilder(
-      animation: anim,
-      builder: (_, __) => Transform.translate(
-        offset: Offset(0, anim.value),
-        child: Container(
-          width: 7,
-          height: 7,
-          decoration: BoxDecoration(
-            color: fg.withValues(alpha: 0.7),
-            shape: BoxShape.circle,
+            child: Row(
+              children: List.generate(3, (i) {
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: ScaleTransition(
+                    scale: Tween<double>(begin: 0.7, end: 1.0).chain(
+                      CurveTween(curve: Curves.easeInOut),
+                    ).animate(
+                      CurvedAnimation(
+                        parent: _ctrl,
+                        curve: Interval(
+                          i * 0.2,
+                          0.6 + i * 0.2,
+                          curve: Curves.easeInOut,
+                        ),
+                      ),
+                    ),
+                    child: Container(
+                      width: 8,
+                      height: 8,
+                      decoration: BoxDecoration(
+                        color: theme.colorScheme.primary,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                  ),
+                );
+              }),
+            ),
           ),
-        ),
+        ],
       ),
     );
   }
