@@ -90,6 +90,21 @@ DATABASE_URL = os.getenv(
     f"sqlite:///{Path(__file__).parent / 'ai_chat_app.db'}",
 ).strip()
 
+
+def get_bind_port() -> int:
+    """Use Render's injected PORT when present; otherwise fall back to 8000."""
+    raw_port = os.getenv("PORT", "8000").strip()
+    try:
+        port = int(raw_port)
+    except ValueError:
+        logger.warning(f"PORT='{raw_port}' is not an integer; falling back to 8000")
+        return 8000
+    if 1 <= port <= 65535:
+        return port
+    logger.warning(f"PORT='{port}' is out of range; falling back to 8000")
+    return 8000
+
+
 VALID_PROVIDERS = {"openai", "openai_compat", "hf_inference", "local"}
 if LLM_PROVIDER not in VALID_PROVIDERS:
     logger.warning(f"Unknown LLM_PROVIDER='{LLM_PROVIDER}' — falling back to 'local'")

@@ -10,7 +10,13 @@ Coverage:
 """
 import pytest
 from fastapi import HTTPException
-from main import ChatRequest, SessionCreate, SessionUpdate, ChatSession, ChatMessageDB
+from main import ChatRequest, SessionCreate, SessionUpdate, ChatSession, ChatMessageDB, get_bind_port
+
+
+def test_bind_port_respects_render_env(monkeypatch):
+    """Render sets PORT dynamically; the app should bind to it."""
+    monkeypatch.setenv("PORT", "4321")
+    assert get_bind_port() == 4321
 
 
 class TestHealthCheck:

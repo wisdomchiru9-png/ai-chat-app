@@ -56,6 +56,6 @@ COPY alembic ./alembic
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD curl -fsS http://localhost:8000/ || exit 1
+  CMD sh -c 'curl -fsS "http://localhost:${PORT:-8000}/" || exit 1'
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 2"]
