@@ -25,14 +25,14 @@ services:
       POSTGRES_PASSWORD: ai_chat
       POSTGRES_DB: ai_chat_app
     ports:
-      - "127.0.0.1:15432:5432"
+      - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ai_chat -d ai_chat_app"]
+      test: ["CMD-SHELL", "pg_isready -U ai_chat"]
       interval: 5s
       timeout: 3s
-      retries: 20
+      retries: 10
 
   backend:
     build:
@@ -51,7 +51,7 @@ services:
       # OPENAI_COMPAT_API_KEY: ollama
       # OPENAI_COMPAT_MODEL: llama3
     ports:
-      - "127.0.0.1:8000:8000"
+      - "8000:8000"
     extra_hosts:
       - "host.docker.internal:host-gateway"   # reach Ollama / other services on the host
     volumes:
@@ -68,7 +68,7 @@ services:
     environment:
       PYTHON_BACKEND_URL: http://backend:8000
     ports:
-      - "127.0.0.1:8787:8787"
+      - "8787:8787"
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
