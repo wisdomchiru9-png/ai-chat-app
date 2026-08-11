@@ -1,0 +1,30 @@
+# --- Python / compiled / lock
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+ai_chat_app.db
+
+# --- Node
+evaluator-service/node_modules/
+evaluator-service/.env
+
+# --- Backend env (secrets, never commit)
+backend/.env
+
+# --- Docker
+.dockerignore
+
+# --- IDE
+.idea/
+.vscode/
+
+# --- Flutter build output
+flutter_app/build/
+flutter_app/.dart_tool/
+flutter_app/.flutter-plugins*
+flutter_app/.pub-cache/
+flutter_app/pubspec.lock

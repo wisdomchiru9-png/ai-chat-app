@@ -1,0 +1,21 @@
+{
+  "name": "ai-chat-llm-evaluator",
+  "version": "1.0.0",
+  "description": "Node.js (Express) LLM evaluator service for the AI Chat app — scores providers on latency, NLP/sentiment accuracy, cost and quality.",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "openai": "^4.52.0",
+    "pino": "^9.2.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

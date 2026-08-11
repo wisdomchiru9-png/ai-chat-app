@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------------------
+# AI Chat — full stack with one command
+# ---------------------------------------------------------------------------
+#   docker compose up -d --build
+#
+# Services:
+#   postgres   :15432 (mapped to 127.0.0.1 to avoid clashing with local PG)
+#                user=ai_chat password=ai_chat db=ai_chat_app
+#   backend    :8000  FastAPI + LLM + Postgres persistence
+#   evaluator  :8787  Node.js LLM evaluation service
+#
+# First time:
+#   docker compose run backend alembic upgrade head
+# or just let main.py's startup create_all() do it (works for both SQLite & PG).
+# ---------------------------------------------------------------------------
+
+name: ai-chat-app
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ai_chat
+      POSTGRES_PASSWORD: ai_chat
+      POSTGRES_DB: ai_chat_app
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_chat -d ai_chat_app"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://ai_chat:ai_chat@postgres:5432/ai_chat_app
+      # --- LLM provider of your choice ---
+      LLM_PROVIDER: local
+      # OPENAI_API_KEY: sk-proj-...
+      # LLM_PROVIDER: openai_compat
+      # OPENAI_COMPAT_BASE_URL: http://host.docker.internal:11434/v1
+      # OPENAI_COMPAT_API_KEY: ollama
+      # OPENAI_COMPAT_MODEL: llama3
+    ports:
+      - "127.0.0.1:8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach Ollama / other services on the host
+    volumes:
+      # Mount your .env if you prefer config outside the image
+      - ./backend/.env:/app/.env:ro
+
+  evaluator:
+    build:
+      context: ./evaluator-service
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      PYTHON_BACKEND_URL: http://backend:8000
+    ports:
+      - "127.0.0.1:8787:8787"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  pg_data:
