@@ -90,6 +90,9 @@ DATABASE_URL = os.getenv(
     f"sqlite:///{Path(__file__).parent / 'ai_chat_app.db'}",
 ).strip()
 
+# Allow disabling local-heavy model loads in constrained environments (Render free tier)
+USE_LOCAL_MODELS = os.getenv("USE_LOCAL_MODELS", "1").strip().lower() in ("1", "true", "yes")
+
 
 def get_bind_port() -> int:
     """Use Render's injected PORT when present; otherwise fall back to 8000."""
@@ -234,6 +237,8 @@ if _HF_TOKEN:
 
 if _sentiment_remote is None:
     try:
+        if not USE_LOCAL_MODELS:
+            raise RuntimeError("Local sentiment models disabled by USE_LOCAL_MODELS env")
         from transformers import pipeline
         _sentiment_local = pipeline(
             "sentiment-analysis",
@@ -406,6 +411,8 @@ class LocalLLM(BaseLLM):
         self._pipe = None
         self.model_label = "local:rule-based"
         try:
+            if not USE_LOCAL_MODELS:
+                raise RuntimeError("Local LLMs disabled by USE_LOCAL_MODELS env")
             from transformers import pipeline
             self._pipe = pipeline(
                 "text-generation",

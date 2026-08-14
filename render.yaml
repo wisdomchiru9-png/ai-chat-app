@@ -16,6 +16,8 @@ services:
         value: local
       - key: DATABASE_URL
         sync: false
+      - key: USE_LOCAL_MODELS
+        value: "0"
   - type: web
     name: ai-chat-evaluator
     runtime: docker
