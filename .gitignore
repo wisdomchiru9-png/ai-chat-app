@@ -11,6 +11,7 @@ ai_chat_app.db
 # --- Node
 evaluator-service/node_modules/
 evaluator-service/.env
+backend/package-lock.json
 
 # --- Backend env (secrets, never commit)
 backend/.env
