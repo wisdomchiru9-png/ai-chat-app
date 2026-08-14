@@ -16,3 +16,19 @@ services:
         value: local
       - key: DATABASE_URL
         sync: false
+  - type: web
+    name: ai-chat-evaluator
+    runtime: docker
+    repo: .
+    dockerfilePath: ./evaluator-service/Dockerfile
+    dockerContext: .
+    plan: free
+    branch: main
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8787
+      - key: PYTHON_BACKEND_URL
+        # Use the internal Render service hostname for the backend; reviewers may override to public URL.
+        value: http://ai-chat-backend:10000
