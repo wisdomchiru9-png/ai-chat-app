@@ -6,7 +6,7 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free
-    branch: main
+    branch: render/add-evaluator
     autoDeploy: true
     healthCheckPath: /
     envVars:
@@ -25,7 +25,7 @@ services:
     dockerfilePath: ./evaluator-service/Dockerfile
     dockerContext: .
     plan: free
-    branch: main
+    branch: render/add-evaluator
     autoDeploy: true
     healthCheckPath: /health
     envVars:
