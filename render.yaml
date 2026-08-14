@@ -2,13 +2,12 @@ services:
   - type: web
     name: ai-chat-backend
     runtime: docker
-    repo: .
     dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free
-    branch: render/add-evaluator
     autoDeploy: true
     healthCheckPath: /
+    numInstances: 1
     envVars:
       - key: PORT
         value: 10000
@@ -18,19 +17,18 @@ services:
         sync: false
       - key: USE_LOCAL_MODELS
         value: "0"
+
   - type: web
     name: ai-chat-evaluator
     runtime: docker
-    repo: .
-    dockerfilePath: ./evaluator-service/Dockerfile
+    dockerfilePath: ./Dockerfile.evaluator
     dockerContext: .
     plan: free
-    branch: render/add-evaluator
     autoDeploy: true
     healthCheckPath: /health
+    numInstances: 1
     envVars:
       - key: PORT
-        value: 8787
+        value: 10000
       - key: PYTHON_BACKEND_URL
-        # Use the internal Render service hostname for the backend; reviewers may override to public URL.
         value: http://ai-chat-backend:10000
