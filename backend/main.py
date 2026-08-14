@@ -85,10 +85,9 @@ LLM_SYSTEM_PROMPT = os.getenv(
     "LLM_SYSTEM_PROMPT",
     "You are a friendly, concise AI assistant. Acknowledge the user's mood naturally. Keep replies under ~300 tokens.",
 ).strip()
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    f"sqlite:///{Path(__file__).parent / 'ai_chat_app.db'}",
-).strip()
+_default_db = f"sqlite:///{Path(__file__).parent / 'ai_chat_app.db'}"
+_raw_db = os.getenv("DATABASE_URL", "").strip()
+DATABASE_URL = _raw_db if _raw_db else _default_db
 
 # Allow disabling local-heavy model loads in constrained environments (Render free tier)
 USE_LOCAL_MODELS = os.getenv("USE_LOCAL_MODELS", "1").strip().lower() in ("1", "true", "yes")
