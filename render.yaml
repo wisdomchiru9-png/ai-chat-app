@@ -20,12 +20,6 @@ services:
       - key: USE_LOCAL_MODELS
         value: "0"
 
-databases:
-  - name: ai-chat-db
-    plan: free
-    databaseName: ai_chat_app
-    user: ai_chat
-
   - type: web
     name: ai-chat-evaluator
     runtime: docker
@@ -40,3 +34,9 @@ databases:
         value: 10000
       - key: PYTHON_BACKEND_URL
         value: http://ai-chat-backend:10000
+
+databases:
+  - name: ai-chat-db
+    plan: free
+    databaseName: ai_chat_app
+    user: ai_chat
