@@ -87,6 +87,10 @@ LLM_SYSTEM_PROMPT = os.getenv(
 ).strip()
 _default_db = f"sqlite:///{Path(__file__).parent / 'ai_chat_app.db'}"
 _raw_db = os.getenv("DATABASE_URL", "").strip()
+if _raw_db.startswith("postgres://"):
+    _raw_db = "postgresql+psycopg://" + _raw_db.removeprefix("postgres://")
+elif _raw_db.startswith("postgresql://"):
+    _raw_db = "postgresql+psycopg://" + _raw_db.removeprefix("postgresql://")
 DATABASE_URL = _raw_db if _raw_db else _default_db
 
 # Allow disabling local-heavy model loads in constrained environments (Render free tier)
