@@ -93,7 +93,7 @@ jobs:
       - name: Check for syntax errors
         run: |
           cd evaluator-service
-          node -c src/index.js || echo "Syntax check passed"
+          node --check src/index.js
   
   docker-build:
     runs-on: ubuntu-latest
@@ -107,14 +107,16 @@ jobs:
       - name: Build backend image
         uses: docker/build-push-action@v4
         with:
-          context: ./backend
+          context: .
+          file: ./Dockerfile
           push: false
           tags: ai-chat-backend:test
       
       - name: Build evaluator image
         uses: docker/build-push-action@v4
         with:
-          context: ./evaluator-service
+          context: .
+          file: ./Dockerfile.evaluator
           push: false
           tags: ai-chat-evaluator:test
   

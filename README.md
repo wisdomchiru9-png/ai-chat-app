@@ -46,7 +46,7 @@ docker compose up -d --build
 ```
 
 Services start:
-- **PostgreSQL** on `127.0.0.1:15432` (db: `ai_chat_app`, user: `ai_chat`)
+- **PostgreSQL** on `127.0.0.1:5432` (db: `ai_chat_app`, user: `ai_chat`)
 - **Backend** on `http://localhost:8000` (FastAPI + LLM)
 - **Evaluator** on `http://localhost:8787` (Node.js ML scorer)
 
