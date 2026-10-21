@@ -1,11 +1,11 @@
 {
-    "name": "ai_chat_app",
-    "short_name": "ai_chat_app",
+    "name": "AI Chat",
+    "short_name": "AI Chat",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "background_color": "#FFFFFF",
+    "theme_color": "#6366F1",
+    "description": "Chat with multiple LLM providers, streamed token by token, with side-by-side model benchmarking.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
