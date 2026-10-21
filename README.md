@@ -159,6 +159,34 @@ flutter run -d android-emulator
 
 ## 🔌 API Endpoints
 
+### Authentication
+
+JWT bearer tokens (HS256) with bcrypt-hashed passwords.
+
+```
+POST   /auth/register     Create an account -> {access_token, token_type, expires_in, user}
+POST   /auth/login        Exchange credentials for a token
+GET    /auth/me           Return the signed-in user
+```
+
+`/sessions*` requires `Authorization: Bearer <token>`. `/chat` and
+`/chat/stream` accept the token optionally: pass a `session_id` to persist
+into a session, or omit it to stay stateless.
+
+```bash
+# Register (or POST /auth/login for an existing account)
+TOKEN=$(curl -s -X POST http://localhost:8000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"me@example.com","password":"secret-pass-123"}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+
+# Authenticated request
+curl http://localhost:8000/sessions -H "Authorization: Bearer $TOKEN"
+```
+
+Set `JWT_SECRET` in production. Without it a random secret is generated at
+startup, so every restart invalidates all previously issued tokens.
+
 ### Chat & Sentiment
 
 ```
@@ -178,7 +206,7 @@ curl -N -X POST http://localhost:8000/chat/stream \
   -d '{"message":"Hello AI!"}'
 ```
 
-### Session Management
+### Session Management (requires auth)
 
 ```
 POST   /sessions                      Create new chat session
@@ -195,19 +223,21 @@ DELETE /sessions/{id}                 Delete session + messages
 # Create session
 curl -X POST http://localhost:8000/sessions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{"title":"My Chat"}'
 # Returns: {"session_id": "abc123...", ...}
 
 # Send message
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{
     "message": "Hello, what is machine learning?",
     "session_id": "abc123..."
   }'
 
 # Get session history
-curl http://localhost:8000/sessions/abc123...
+curl http://localhost:8000/sessions/abc123... -H "Authorization: Bearer $TOKEN"
 ```
 
 See `postman/` folder for complete API collection.
@@ -325,15 +355,25 @@ Swap providers anytime by updating `.env` — no code changes needed.
 ### On Render.com (Free Tier)
 
 1. Push to GitHub
-2. Create PostgreSQL database on Render
+2. Create PostgreSQL database on Render (the included `render.yaml` blueprint does this for you)
 3. Create Web Service pointing to this repo
 4. Set environment:
    ```
    LLM_PROVIDER=openai
    OPENAI_API_KEY=sk-...
    DATABASE_URL=postgresql://...
+   JWT_SECRET=<run: python -c "import secrets;print(secrets.token_urlsafe(48))">
    ```
-5. Deploy!
+5. Run the migrations against the production database:
+   ```bash
+   cd backend
+   DATABASE_URL=postgresql://... alembic upgrade head
+   ```
+6. Deploy!
+
+The app creates missing tables on startup, but it never adds columns to
+existing tables — so run `alembic upgrade head` after any model change,
+otherwise queries against the new columns fail.
 
 ### On Railway
 

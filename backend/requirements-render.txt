@@ -8,5 +8,12 @@ httpx>=0.25.0
 sqlalchemy>=2.0.23
 psycopg[binary]>=3.1.12
 
+# Auth (JWT bearer tokens + bcrypt password hashing)
+pyjwt>=2.8.0
+bcrypt>=4.1.0
+
+# Database migrations
+alembic>=1.13.0
+
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
