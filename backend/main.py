@@ -848,7 +848,7 @@ def _trim_to_context_window(
     return ([system] + tail) if system else tail
 
 
-def build_messages_for_llm(request: ChatRequest, db_history: list[dict] | None = None) -> list[dict]:
+def build_messages_for_llm(request: ChatRequest, db_history: Optional[list[dict]] = None) -> list[dict]:
     """Priority: explicit request.history > session history loaded from DB > empty."""
     if request.history is not None:
         norm = _normalise_history(request.history)
@@ -1101,7 +1101,7 @@ def chat(
     try:
         # --- Session / persistence prep
         session = _resolve_session(db, request.session_id, user.id if user else None)
-        db_history: list[dict] | None = None
+        db_history: Optional[list[dict]] = None
         if session is not None and request.history is None:
             db_history = [
                 {"role": m.role, "content": m.content}
@@ -1160,7 +1160,7 @@ def chat_stream(
     user_id = user.id if user else None
     # Validated up front so a bad session_id still returns a real 404.
     session = _resolve_session(db, request.session_id, user_id)
-    db_history: list[dict] | None = None
+    db_history: Optional[list[dict]] = None
     if session is not None and request.history is None:
         db_history = [{"role": m.role, "content": m.content} for m in session.messages]
 
