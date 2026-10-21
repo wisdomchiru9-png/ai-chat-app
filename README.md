@@ -163,8 +163,19 @@ flutter run -d android-emulator
 
 ```
 POST   /chat              Chat with LLM, optionally persist to session
+POST   /chat/stream       Same, but streams tokens as Server-Sent Events
 POST   /sentiment         Analyze text sentiment (POSITIVE/NEGATIVE)
 GET    /                  Health check + service info
+```
+
+`POST /chat/stream` emits `data: <json>` events with `type` =
+`meta` → `provider` → `token`… → `done` (or `error`). The `token` events
+reassemble into the `reply` carried by the final `done` event:
+
+```bash
+curl -N -X POST http://localhost:8000/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Hello AI!"}'
 ```
 
 ### Session Management

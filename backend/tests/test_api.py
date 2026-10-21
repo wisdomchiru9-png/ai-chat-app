@@ -8,9 +8,22 @@ Coverage:
   - Session CRUD operations
   - Error handling and edge cases
 """
+import json
 import pytest
 from fastapi import HTTPException
-from main import ChatRequest, SessionCreate, SessionUpdate, ChatSession, ChatMessageDB, get_bind_port
+from conftest import TEST_EMAIL, TEST_PASSWORD
+from main import (
+    BaseLLM,
+    ChatRequest,
+    SessionCreate,
+    SessionUpdate,
+    ChatSession,
+    ChatMessageDB,
+    User,
+    chunk_words,
+    get_bind_port,
+    stream_reply_with_history,
+)
 
 
 def test_bind_port_respects_render_env(monkeypatch):
@@ -361,6 +374,248 @@ class TestChatWithPersistence:
         data = session_resp.json()
         # Title should start with the user message (truncated)
         assert "Explain" in data["title"] or "quantum" in data["title"]
+
+
+def _parse_sse(body: str) -> list[dict]:
+    """Turn a raw SSE body into the list of JSON payloads it carried."""
+    events = []
+    for line in body.splitlines():
+        if line.startswith("data:"):
+            events.append(json.loads(line[len("data:"):].strip()))
+    return events
+
+
+class TestChatStreaming:
+    """Test the POST /chat/stream Server-Sent Events endpoint."""
+
+    def test_stream_event_sequence(self, client):
+        """Stream should emit meta → provider → tokens → done."""
+        response = client.post("/chat/stream", json={"message": "Hello there!"})
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+
+        events = _parse_sse(response.text)
+        types = [e["type"] for e in events]
+
+        assert types[0] == "meta"
+        assert types[-1] == "done"
+        assert "provider" in types
+        assert types.count("token") >= 1
+
+        # Tokens must reassemble into exactly the reported reply
+        streamed = "".join(e["text"] for e in events if e["type"] == "token")
+        assert streamed.strip() == events[-1]["reply"]
+        assert events[-1]["provider"]
+
+    def test_stream_meta_carries_sentiment(self, client):
+        """The first event should carry sentiment and confidence."""
+        response = client.post("/chat/stream", json={"message": "I love this so much!"})
+        meta = _parse_sse(response.text)[0]
+
+        assert meta["type"] == "meta"
+        assert meta["sentiment"] in ["POSITIVE", "NEGATIVE"]
+        assert 0 <= meta["confidence"] <= 1
+        assert meta["session_id"] is None
+
+    def test_stream_persists_turn(self, client):
+        """Streaming with a session_id should persist both turns."""
+        session_id = client.post("/sessions", json={}).json()["session_id"]
+
+        response = client.post(
+            "/chat/stream",
+            json={"message": "Stream this please", "session_id": session_id},
+        )
+        done = _parse_sse(response.text)[-1]
+        assert done["type"] == "done"
+        assert done["session_id"] == session_id
+
+        detail = client.get(f"/sessions/{session_id}").json()
+        assert detail["message_count"] == 2
+        assert detail["title"] == "Stream this please"
+
+        messages = client.get(f"/sessions/{session_id}/messages").json()
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"] == "Stream this please"
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == done["reply"]
+
+    def test_stream_multi_turn_uses_history(self, client):
+        """Two streamed turns should leave four persisted messages."""
+        session_id = client.post("/sessions", json={}).json()["session_id"]
+
+        client.post("/chat/stream", json={"message": "My name is Alice", "session_id": session_id})
+        client.post("/chat/stream", json={"message": "What's my name?", "session_id": session_id})
+
+        assert client.get(f"/sessions/{session_id}").json()["message_count"] == 4
+
+    def test_stream_unknown_session_returns_404(self, client):
+        """A bad session_id must fail before the stream opens."""
+        response = client.post("/chat/stream", json={"message": "hi", "session_id": "nope"})
+        assert response.status_code == 404
+
+    def test_stream_rejects_empty_message(self, client):
+        """Validation still applies to the streaming endpoint."""
+        response = client.post("/chat/stream", json={"message": ""})
+        assert response.status_code == 422
+
+
+class TestStreamingHelpers:
+    """Unit tests for the streaming internals."""
+
+    def test_chunk_words_reassembles(self):
+        """Chunked text must rejoin into the original sentence."""
+        text = "one two three four five six seven"
+        assert "".join(chunk_words(text, words_per_chunk=2)).strip() == text
+
+    def test_falls_back_when_provider_stream_fails(self, monkeypatch):
+        """A provider that dies immediately should be replaced by the next one."""
+
+        class BoomLLM(BaseLLM):
+            name = "boom"
+
+            def _post_init(self):
+                self.model_label = "boom:test"
+                self.available = True
+
+            def generate(self, messages):
+                return "unused"
+
+            def stream(self, messages):
+                raise RuntimeError("provider exploded")
+                yield  # pragma: no cover
+
+        monkeypatch.setattr("main.active_llm", lambda: BoomLLM())
+
+        events = list(stream_reply_with_history([{"role": "user", "content": "hi"}], "POSITIVE"))
+        provider = next(payload for kind, payload in events if kind == "provider")
+
+        assert provider["name"] != "boom"
+        assert any(kind == "token" for kind, _ in events)
+
+
+class TestAuth:
+    """Test registration, login and route protection."""
+
+    def test_register_returns_token_and_user(self, anon_client):
+        """Registering should normalise the email and issue a token."""
+        res = anon_client.post(
+            "/auth/register",
+            json={"email": "New.User@Example.com", "password": "hunter2hunter2"},
+        )
+        assert res.status_code == 201
+        body = res.json()
+
+        assert body["token_type"] == "bearer"
+        assert body["access_token"]
+        assert body["expires_in"] > 0
+        assert body["user"]["email"] == "new.user@example.com"
+        assert body["user"]["display_name"] == "new.user"
+        assert "password" not in json.dumps(body).lower()
+
+    def test_register_rejects_invalid_email(self, anon_client):
+        res = anon_client.post(
+            "/auth/register",
+            json={"email": "not-an-email", "password": "hunter2hunter2"},
+        )
+        assert res.status_code == 422
+
+    def test_register_rejects_short_password(self, anon_client):
+        res = anon_client.post(
+            "/auth/register",
+            json={"email": "short@example.com", "password": "tiny"},
+        )
+        assert res.status_code == 422
+
+    def test_register_rejects_duplicate_email(self, anon_client):
+        payload = {"email": "dupe@example.com", "password": "hunter2hunter2"}
+        assert anon_client.post("/auth/register", json=payload).status_code == 201
+        assert anon_client.post("/auth/register", json=payload).status_code == 409
+
+    def test_password_is_stored_hashed(self, anon_client, test_db):
+        """The raw password must never be persisted."""
+        anon_client.post(
+            "/auth/register",
+            json={"email": "hash@example.com", "password": "hunter2hunter2"},
+        )
+        user = test_db.query(User).filter(User.email == "hash@example.com").one()
+
+        assert user.password_hash
+        assert user.password_hash != "hunter2hunter2"
+        assert user.password_hash.startswith("$2")  # bcrypt hash prefix
+
+    def test_login_success(self, anon_client):
+        anon_client.post(
+            "/auth/register",
+            json={"email": "login@example.com", "password": "hunter2hunter2"},
+        )
+        res = anon_client.post(
+            "/auth/login",
+            json={"email": "LOGIN@example.com", "password": "hunter2hunter2"},
+        )
+        assert res.status_code == 200
+        assert res.json()["user"]["email"] == "login@example.com"
+
+    def test_login_wrong_password(self, anon_client):
+        anon_client.post(
+            "/auth/register",
+            json={"email": "login2@example.com", "password": "hunter2hunter2"},
+        )
+        res = anon_client.post(
+            "/auth/login",
+            json={"email": "login2@example.com", "password": "wrong-password"},
+        )
+        assert res.status_code == 401
+
+    def test_login_unknown_email(self, anon_client):
+        res = anon_client.post(
+            "/auth/login",
+            json={"email": "ghost@example.com", "password": "hunter2hunter2"},
+        )
+        assert res.status_code == 401
+
+    def test_me_returns_signed_in_user(self, client):
+        res = client.get("/auth/me")
+        assert res.status_code == 200
+        assert res.json()["email"] == TEST_EMAIL
+
+    def test_protected_routes_need_a_token(self, anon_client):
+        assert anon_client.get("/auth/me").status_code == 401
+        assert anon_client.get("/sessions").status_code == 401
+        assert anon_client.post("/sessions", json={}).status_code == 401
+
+    def test_malformed_token_rejected(self, anon_client):
+        res = anon_client.get("/sessions", headers={"Authorization": "Bearer not.a.token"})
+        assert res.status_code == 401
+
+    def test_sessions_are_isolated_between_users(self, client):
+        """One user must not be able to read or delete another user's session."""
+        mine = client.post("/sessions", json={"title": "Mine"}).json()["session_id"]
+
+        other = client.post(
+            "/auth/register",
+            json={"email": "other@example.com", "password": "hunter2hunter2"},
+        ).json()
+        other_headers = {"Authorization": f"Bearer {other['access_token']}"}
+
+        assert len(client.get("/sessions").json()) == 1
+        assert client.get("/sessions", headers=other_headers).json() == []
+        assert client.get(f"/sessions/{mine}", headers=other_headers).status_code == 404
+        assert client.delete(f"/sessions/{mine}", headers=other_headers).status_code == 404
+
+    def test_chat_into_stored_session_needs_auth(self, anon_client):
+        res = anon_client.post("/chat", json={"message": "hi", "session_id": "abc"})
+        assert res.status_code == 401
+
+    def test_stateless_chat_allowed_without_auth(self, anon_client):
+        """Stateless chat is what the Node evaluator calls, so it stays open."""
+        res = anon_client.post("/chat", json={"message": "hello there"})
+        assert res.status_code == 200
+        assert res.json()["session_id"] is None
+
+    def test_root_reports_auth_config(self, client):
+        body = client.get("/").json()
+        assert body["auth"]["scheme"] == "bearer"
+        assert body["auth"]["enabled"] is True
 
 
 class TestMessageDetails:

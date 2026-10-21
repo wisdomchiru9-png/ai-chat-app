@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 
+import 'analytics_screen.dart';
+import 'auth.dart';
 import 'theme.dart';
 
 void main() {
@@ -17,8 +19,66 @@ class BackendConfig {
   static const String kAndroidEmulator = "http://10.0.2.2:8000";
   static String baseUrl = kAndroidEmulator;
 
-  static String get chatEndpoint => "$baseUrl/chat";
+  /// Bearer token for the signed-in user. Null while signed out.
+  static String? authToken;
+
+  static String get chatStreamEndpoint => "$baseUrl/chat/stream";
   static String get sessionsEndpoint => "$baseUrl/sessions";
+  static String get benchmarkEndpoint => "$baseUrl/benchmark";
+
+  /// Headers for JSON requests, including the bearer token when signed in.
+  static Map<String, String> jsonHeaders() => {
+        "Content-Type": "application/json",
+        if (authToken != null && authToken!.isNotEmpty)
+          "Authorization": "Bearer $authToken",
+      };
+}
+
+// ---------------------------------------------------------------------------
+// Streaming client (Server-Sent Events from POST /chat/stream)
+// ---------------------------------------------------------------------------
+class ChatStreamEvent {
+  final String type;
+  final Map<String, dynamic> data;
+
+  ChatStreamEvent(this.type, this.data);
+}
+
+Stream<ChatStreamEvent> streamChat(Map<String, dynamic> body) async* {
+  final client = http.Client();
+  try {
+    final request = http.Request(
+      "POST",
+      Uri.parse(BackendConfig.chatStreamEndpoint),
+    )
+      ..headers.addAll(BackendConfig.jsonHeaders())
+      ..headers["Accept"] = "text/event-stream"
+      ..body = jsonEncode(body);
+
+    final response = await client.send(request).timeout(const Duration(seconds: 120));
+
+    if (response.statusCode != 200) {
+      final text = await response.stream.bytesToString();
+      String detail = text;
+      try {
+        detail = jsonDecode(text)["detail"] ?? text;
+      } catch (_) {}
+      throw Exception("Server error ${response.statusCode}: $detail");
+    }
+
+    final lines =
+        response.stream.transform(utf8.decoder).transform(const LineSplitter());
+    await for (final line in lines) {
+      if (!line.startsWith("data:")) continue;
+      final raw = line.substring(5).trim();
+      if (raw.isEmpty) continue;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, dynamic>) continue;
+      yield ChatStreamEvent(decoded["type"]?.toString() ?? "", decoded);
+    }
+  } finally {
+    client.close();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -33,6 +93,66 @@ class AIChatApp extends StatefulWidget {
 
 class _AIChatAppState extends State<AIChatApp> {
   String? _activeSessionId;
+  AuthUser? _user;
+  bool _restoring = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _restoreSession();
+  }
+
+  /// Reuses a stored token when the backend still accepts it, otherwise
+  /// falls back to the login screen.
+  Future<void> _restoreSession() async {
+    final stored = await AuthStore.read();
+    final token = stored.token;
+
+    if (token != null && token.isNotEmpty) {
+      BackendConfig.authToken = token;
+      try {
+        final user = await AuthApi.me(BackendConfig.baseUrl, token);
+        if (!mounted) return;
+        setState(() {
+          _user = user;
+          _restoring = false;
+        });
+        return;
+      } on AuthException {
+        // Expired token or an unreachable backend: ask the user to sign in.
+        BackendConfig.authToken = null;
+        await AuthStore.clear();
+      }
+    }
+
+    if (!mounted) return;
+    setState(() => _restoring = false);
+  }
+
+  Future<void> _handleAuthenticated(AuthResult result) async {
+    BackendConfig.authToken = result.token;
+    await AuthStore.save(result.token, result.user.email);
+    if (!mounted) return;
+    setState(() => _user = result.user);
+  }
+
+  Future<void> _logout() async {
+    BackendConfig.authToken = null;
+    await AuthStore.clear();
+    if (!mounted) return;
+    setState(() {
+      _user = null;
+      _activeSessionId = null;
+    });
+  }
+
+  Future<void> _configureBackend() async {
+    final url = await showBackendUrlDialog(context);
+    if (url == null || !mounted) return;
+    setState(() {
+      BackendConfig.baseUrl = url.replaceFirst(RegExp(r'/$'), '');
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -41,32 +161,108 @@ class _AIChatAppState extends State<AIChatApp> {
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light(),
       darkTheme: AppTheme.dark(),
-      home: _activeSessionId == null
-          ? SessionListScreen(
-              onSelectSession: (sessionId) {
-                setState(() => _activeSessionId = sessionId);
-              },
-            )
-          : ChatScreen(
-              sessionId: _activeSessionId,
-              onBack: () {
-                setState(() => _activeSessionId = null);
-              },
-            ),
+      home: _buildHome(),
     );
   }
+
+  Widget _buildHome() {
+    if (_restoring) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    if (_user == null) {
+      return LoginScreen(
+        baseUrl: BackendConfig.baseUrl,
+        onAuthenticated: _handleAuthenticated,
+        onConfigureBackend: _configureBackend,
+      );
+    }
+
+    if (_activeSessionId == null) {
+      return SessionListScreen(
+        userLabel: _user!.email ?? _user!.displayName,
+        onSelectSession: (sessionId) {
+          setState(() => _activeSessionId = sessionId);
+        },
+        onLogout: _logout,
+      );
+    }
+
+    return ChatScreen(
+      sessionId: _activeSessionId,
+      onBack: () {
+        setState(() => _activeSessionId = null);
+      },
+    );
+  }
+}
+
+/// Prompts for the backend base URL. Returns the trimmed URL, or null when
+/// the user cancels.
+Future<String?> showBackendUrlDialog(BuildContext context) async {
+  final controller = TextEditingController(text: BackendConfig.baseUrl);
+  final result = await showDialog<String>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text("Backend URL"),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text("Enter the base URL of your FastAPI backend:"),
+          const SizedBox(height: 16),
+          TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(
+              hintText: "http://localhost:8000",
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              ActionChip(
+                label: const Text("Android Emulator"),
+                onPressed: () => controller.text = BackendConfig.kAndroidEmulator,
+              ),
+              ActionChip(
+                label: const Text("Localhost"),
+                onPressed: () => controller.text = BackendConfig.kLocalhost,
+              ),
+            ],
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text("Cancel"),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+          child: const Text("Save"),
+        ),
+      ],
+    ),
+  );
+
+  if (result == null || result.isEmpty) return null;
+  return result.replaceFirst(RegExp(r'/$'), '');
 }
 
 // ---------------------------------------------------------------------------
 // Models
 // ---------------------------------------------------------------------------
 class ChatMessage {
-  final String text;
+  String text;
   final bool isUser;
-  final String? sentiment;
-  final double? confidence;
-  final String? provider;
-  final String? model;
+  String? sentiment;
+  double? confidence;
+  String? provider;
+  String? model;
   final DateTime timestamp;
 
   ChatMessage({
@@ -108,10 +304,14 @@ class Session {
 // ---------------------------------------------------------------------------
 class SessionListScreen extends StatefulWidget {
   final Function(String) onSelectSession;
+  final VoidCallback? onLogout;
+  final String? userLabel;
 
   const SessionListScreen({
     super.key,
     required this.onSelectSession,
+    this.onLogout,
+    this.userLabel,
   });
 
   @override
@@ -131,20 +331,25 @@ class _SessionListScreenState extends State<SessionListScreen> {
     try {
       final response = await http.get(
         Uri.parse(BackendConfig.sessionsEndpoint),
+        headers: BackendConfig.jsonHeaders(),
       ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body) as List;
         return data.map((s) => Session.fromJson(s)).toList();
       }
+      if (response.statusCode == 401) {
+        throw Exception("Your session expired. Please sign in again.");
+      }
+      throw Exception("Server error ${response.statusCode}");
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text("Failed to load sessions: $e")),
         );
       }
+      rethrow;
     }
-    return [];
   }
 
   Future<void> _createNewSession() async {
@@ -179,7 +384,7 @@ class _SessionListScreenState extends State<SessionListScreen> {
       try {
         final response = await http.post(
           Uri.parse(BackendConfig.sessionsEndpoint),
-          headers: {"Content-Type": "application/json"},
+          headers: BackendConfig.jsonHeaders(),
           body: jsonEncode({"title": result}),
         ).timeout(const Duration(seconds: 10));
 
@@ -207,10 +412,23 @@ class _SessionListScreenState extends State<SessionListScreen> {
         centerTitle: true,
         actions: [
           IconButton(
+            icon: const Icon(Icons.insights_outlined),
+            tooltip: "Model analytics",
+            onPressed: _openAnalytics,
+          ),
+          IconButton(
             icon: const Icon(Icons.settings_outlined),
             tooltip: "Backend settings",
             onPressed: _showSettings,
           ),
+          if (widget.onLogout != null)
+            IconButton(
+              icon: const Icon(Icons.logout),
+              tooltip: widget.userLabel == null
+                  ? "Sign out"
+                  : "Sign out (${widget.userLabel})",
+              onPressed: widget.onLogout,
+            ),
         ],
       ),
       body: FutureBuilder<List<Session>>(
@@ -305,63 +523,24 @@ class _SessionListScreenState extends State<SessionListScreen> {
   }
 
   Future<void> _showSettings() async {
-    final controller = TextEditingController(text: BackendConfig.baseUrl);
-    final result = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text("Backend URL"),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text("Enter the base URL of your FastAPI backend:"),
-            const SizedBox(height: 16),
-            TextField(
-              controller: controller,
-              autofocus: true,
-              decoration: const InputDecoration(
-                hintText: "http://localhost:8000",
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                ActionChip(
-                  label: const Text("Android Emulator"),
-                  onPressed: () => controller.text = BackendConfig.kAndroidEmulator,
-                ),
-                ActionChip(
-                  label: const Text("Localhost"),
-                  onPressed: () => controller.text = BackendConfig.kLocalhost,
-                ),
-              ],
-            ),
-          ],
+    final url = await showBackendUrlDialog(context);
+    if (url == null || !mounted) return;
+
+    setState(() {
+      BackendConfig.baseUrl = url;
+      _sessionsFuture = _fetchSessions();
+    });
+  }
+
+  void _openAnalytics() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => AnalyticsScreen(
+          baseUrl: BackendConfig.baseUrl,
+          authToken: BackendConfig.authToken,
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text("Cancel"),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text("Save"),
-          ),
-        ],
       ),
     );
-
-    if (result != null && result.isNotEmpty) {
-      BackendConfig.baseUrl = result.replaceFirst(RegExp(r'/$'), '');
-      if (mounted) {
-        setState(() {
-          _sessionsFuture = _fetchSessions();
-        });
-      }
-    }
   }
 }
 
@@ -389,6 +568,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   final List<ChatMessage> _messages = [];
   bool _isLoading = false;
+  bool _isStreaming = false;
 
   @override
   void initState() {
@@ -440,6 +620,8 @@ class _ChatScreenState extends State<ChatScreen> {
     _controller.clear();
     _scrollToBottom(force: true);
 
+    ChatMessage? reply;
+    var replyInserted = false;
     try {
       final history = _messages
           .where((m) =>
@@ -457,33 +639,60 @@ class _ChatScreenState extends State<ChatScreen> {
         if (widget.sessionId != null) "session_id": widget.sessionId,
       };
 
-      final response = await http
-          .post(
-            Uri.parse(BackendConfig.chatEndpoint),
-            headers: {"Content-Type": "application/json"},
-            body: jsonEncode(body),
-          )
-          .timeout(const Duration(seconds: 120));
+      await for (final event in streamChat(body)) {
+        switch (event.type) {
+          case "meta":
+            reply ??= ChatMessage(
+              text: "",
+              isUser: false,
+              sentiment: event.data["sentiment"],
+              confidence: (event.data["confidence"] as num?)?.toDouble(),
+            );
+          case "provider":
+            reply
+              ?..provider = event.data["provider"]
+              ..model = event.data["model"];
+            if (mounted) setState(() {});
+          case "token":
+            if (reply == null) break;
+            reply.text += (event.data["text"] ?? "").toString();
+            // Show the bubble only once there is text, so the typing
+            // indicator stays up while a slow provider warms up.
+            if (!replyInserted) {
+              replyInserted = true;
+              setState(() => _isStreaming = true);
+              _insertMessage(reply);
+            }
+            if (mounted) setState(() {});
+            _scrollToBottom();
+          case "done":
+            if (reply == null) break;
+            final full = event.data["reply"];
+            if (full is String && full.isNotEmpty) reply.text = full;
+            if (!replyInserted) {
+              replyInserted = true;
+              _insertMessage(reply);
+            }
+            if (mounted) setState(() {});
+          case "error":
+            final detail = (event.data["detail"] ?? "unknown error").toString();
+            if (reply == null) {
+              _insertMessage(
+                  ChatMessage(text: "Server error: $detail", isUser: false));
+            } else {
+              reply.text = "Server error: $detail";
+              if (!replyInserted) {
+                replyInserted = true;
+                _insertMessage(reply);
+              }
+              if (mounted) setState(() {});
+            }
+        }
+      }
 
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        _insertMessage(ChatMessage(
-          text: data["reply"] ?? "(empty reply)",
-          isUser: false,
-          sentiment: data["sentiment"],
-          confidence: (data["confidence"] as num?)?.toDouble(),
-          provider: data["provider"],
-          model: data["model"],
-        ));
-      } else {
-        String detail = response.body;
-        try {
-          detail = jsonDecode(response.body)["detail"] ?? detail;
-        } catch (_) {}
-        _insertMessage(ChatMessage(
-          text: "Server error ${response.statusCode}: $detail",
-          isUser: false,
-        ));
+      if (reply != null && reply.text.trim().isEmpty) {
+        reply.text = "(empty reply)";
+        if (mounted) setState(() {});
       }
     } catch (e) {
       _insertMessage(ChatMessage(
@@ -493,70 +702,24 @@ class _ChatScreenState extends State<ChatScreen> {
         isUser: false,
       ));
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _isStreaming = false;
+        });
+      }
       _scrollToBottom(force: true);
     }
   }
 
   Future<void> _showSettings() async {
-    final controller = TextEditingController(text: BackendConfig.baseUrl);
-    final result = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text("Backend URL"),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text("Enter the base URL of your FastAPI backend:"),
-            const SizedBox(height: 16),
-            TextField(
-              controller: controller,
-              autofocus: true,
-              decoration: const InputDecoration(
-                hintText: "http://localhost:8000",
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                ActionChip(
-                  label: const Text("Android Emulator"),
-                  onPressed: () => controller.text = BackendConfig.kAndroidEmulator,
-                ),
-                ActionChip(
-                  label: const Text("Localhost"),
-                  onPressed: () => controller.text = BackendConfig.kLocalhost,
-                ),
-              ],
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text("Cancel"),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text("Save"),
-          ),
-        ],
-      ),
+    final url = await showBackendUrlDialog(context);
+    if (url == null || !mounted) return;
+
+    setState(() => BackendConfig.baseUrl = url);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text("Backend set to ${BackendConfig.baseUrl}")),
     );
-    if (result != null && result.isNotEmpty) {
-      setState(() {
-        BackendConfig.baseUrl = result.replaceFirst(RegExp(r'/$'), '');
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Backend set to ${BackendConfig.baseUrl}")),
-        );
-      }
-    }
   }
 
   Future<void> _clearChat() async {
@@ -642,7 +805,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
                   ),
           ),
-          if (_isLoading) const _TypingIndicator(),
+          if (_isLoading && !_isStreaming) const _TypingIndicator(),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 8, 24),
             child: Row(

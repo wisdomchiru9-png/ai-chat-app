@@ -36,9 +36,12 @@ Docs: http://localhost:8000/docs
 """
 
 import os
+import json
 import logging
+import re
+import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Union, Iterator
 
@@ -48,8 +51,12 @@ try:
 except Exception:
     pass
 
+import bcrypt
+import jwt
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, ConfigDict
 
 # ---------------------------------------------------------------------------
@@ -95,6 +102,18 @@ DATABASE_URL = _raw_db if _raw_db else _default_db
 
 # Allow disabling local-heavy model loads in constrained environments (Render free tier)
 USE_LOCAL_MODELS = os.getenv("USE_LOCAL_MODELS", "1").strip().lower() in ("1", "true", "yes")
+
+# --- Auth (JWT) -------------------------------------------------------------
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", str(60 * 24 * 7)))
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
+if not JWT_SECRET:
+    # Convenient for local dev, but tokens stop working when the process restarts.
+    JWT_SECRET = secrets.token_urlsafe(48)
+    logger.warning(
+        "JWT_SECRET is not set - generated a temporary one. "
+        "Set JWT_SECRET in .env so issued tokens survive a restart."
+    )
 
 
 def get_bind_port() -> int:
@@ -160,6 +179,8 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     external_id: Mapped[str] = mapped_column(String(64), unique=True, index=True,
                                               default=lambda: f"user_{uuid.uuid4().hex[:12]}")
+    email: Mapped[Optional[str]] = mapped_column(String(255), unique=True, index=True, nullable=True)
+    password_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     display_name: Mapped[str] = mapped_column(String(120), default="User")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     sessions: Mapped[list["ChatSession"]] = relationship(back_populates="user",
@@ -207,8 +228,16 @@ def get_db() -> Iterator[SASession]:
         db.close()
 
 
+def get_db_factory():
+    """
+    Session factory for work that happens after the request-scoped session is
+    closed, e.g. persisting a reply once a StreamingResponse has finished.
+    """
+    return SessionLocal
+
+
 def _get_or_create_default_user(db: SASession) -> User:
-    """For a portfolio / single-user app, use one default user id."""
+    """Legacy single-user owner, kept so pre-auth rows in an existing DB stay queryable."""
     external_id = "default_user"
     user = db.query(User).filter(User.external_id == external_id).one_or_none()
     if user is None:
@@ -216,6 +245,88 @@ def _get_or_create_default_user(db: SASession) -> User:
         db.add(user)
         db.commit()
         db.refresh(user)
+    return user
+
+
+# ---------------------------------------------------------------------------
+# Auth: password hashing + JWT
+# ---------------------------------------------------------------------------
+_BCRYPT_MAX_BYTES = 72  # bcrypt silently truncates anything longer
+
+
+def hash_password(raw: str) -> str:
+    return bcrypt.hashpw(raw.encode("utf-8")[:_BCRYPT_MAX_BYTES], bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(raw: str, hashed: Optional[str]) -> bool:
+    if not hashed:
+        return False
+    try:
+        return bcrypt.checkpw(raw.encode("utf-8")[:_BCRYPT_MAX_BYTES], hashed.encode("utf-8"))
+    except ValueError:
+        return False
+
+
+def create_access_token(user: User) -> tuple[str, int]:
+    """Return (token, expires_in_seconds) for a user."""
+    expires_in = JWT_EXPIRE_MINUTES * 60
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user.id),
+        "email": user.email,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(seconds=expires_in)).timestamp()),
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return token, expires_in
+
+
+_bearer = HTTPBearer(auto_error=False)
+
+
+def _user_from_credentials(
+    credentials: Optional[HTTPAuthorizationCredentials],
+    db: SASession,
+) -> Optional[User]:
+    if credentials is None or not credentials.credentials:
+        return None
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired",
+                            headers={"WWW-Authenticate": "Bearer"})
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid authentication token",
+                            headers={"WWW-Authenticate": "Bearer"})
+    try:
+        user_id = int(payload.get("sub", ""))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid authentication token",
+                            headers={"WWW-Authenticate": "Bearer"})
+    user = db.get(User, user_id)
+    if user is None or user.email is None:
+        raise HTTPException(status_code=401, detail="User no longer exists",
+                            headers={"WWW-Authenticate": "Bearer"})
+    return user
+
+
+def optional_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    db: SASession = Depends(get_db),
+) -> Optional[User]:
+    """Resolve the caller when a valid token is present; None for anonymous requests."""
+    return _user_from_credentials(credentials, db)
+
+
+def current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    db: SASession = Depends(get_db),
+) -> User:
+    """Require a signed-in caller."""
+    user = _user_from_credentials(credentials, db)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Not authenticated",
+                            headers={"WWW-Authenticate": "Bearer"})
     return user
 
 
@@ -306,6 +417,38 @@ class BaseLLM:
     def generate(self, messages: list[dict]) -> str:
         raise NotImplementedError
 
+    def stream(self, messages: list[dict]) -> Iterator[str]:
+        """Yield reply text in chunks. Default: one chunk, no native streaming."""
+        text = self.generate(messages)
+        if text:
+            yield text
+
+
+def _openai_chat_stream(client, model: str, messages: list[dict]) -> Iterator[str]:
+    """Shared streaming implementation for the OpenAI-compatible SDK."""
+    stream = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
+        stream=True,
+    )
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        piece = chunk.choices[0].delta.content
+        if piece:
+            yield piece
+
+
+def chunk_words(text: str, words_per_chunk: int = 4) -> Iterator[str]:
+    """Split finished text into small chunks, used when a provider cannot stream."""
+    words = text.split()
+    for i in range(0, len(words), words_per_chunk):
+        group = words[i:i + words_per_chunk]
+        suffix = "" if i + words_per_chunk >= len(words) else " "
+        yield " ".join(group) + suffix
+
 
 class OpenAILLM(BaseLLM):
     name = "openai"
@@ -333,6 +476,9 @@ class OpenAILLM(BaseLLM):
             max_tokens=LLM_MAX_TOKENS,
         )
         return (resp.choices[0].message.content or "").strip()
+
+    def stream(self, messages: list[dict]) -> Iterator[str]:
+        yield from _openai_chat_stream(self.client, self.model, messages)
 
 
 class OpenAICompatLLM(BaseLLM):
@@ -362,6 +508,9 @@ class OpenAICompatLLM(BaseLLM):
             max_tokens=LLM_MAX_TOKENS,
         )
         return (resp.choices[0].message.content or "").strip()
+
+    def stream(self, messages: list[dict]) -> Iterator[str]:
+        yield from _openai_chat_stream(self.client, self.model, messages)
 
 
 class HFInferenceLLM(BaseLLM):
@@ -405,6 +554,20 @@ class HFInferenceLLM(BaseLLM):
             if stop in text:
                 text = text.split(stop)[0]
         return text.strip()
+
+    def stream(self, messages: list[dict]) -> Iterator[str]:
+        prompt = self._to_chatml(messages)
+        for token in self.client.text_generation(
+            prompt,
+            max_new_tokens=LLM_MAX_TOKENS,
+            temperature=LLM_TEMPERATURE,
+            top_p=0.92,
+            do_sample=True,
+            stream=True,
+            stop_sequences=["</s>", "<|user|>", "<|system|>"],
+        ):
+            if token:
+                yield str(token)
 
 
 class LocalLLM(BaseLLM):
@@ -484,6 +647,10 @@ class LocalLLM(BaseLLM):
             except Exception as e:
                 logger.warning(f"Local distilgpt2 failed, falling back to rule-based: {e}")
         return self._rule_based(messages, sentiment_label)
+
+    def stream(self, messages: list[dict], sentiment_label: str = "POSITIVE") -> Iterator[str]:
+        # The transformers pipeline cannot stream, so emit the finished reply word-group by word.
+        yield from chunk_words(self.generate(messages, sentiment_label=sentiment_label))
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +769,38 @@ class MessageOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Auth schemas
+# ---------------------------------------------------------------------------
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+
+
+class UserRegister(BaseModel):
+    email: str = Field(..., min_length=5, max_length=255)
+    password: str = Field(..., min_length=8, max_length=128)
+    display_name: Optional[str] = Field(default=None, max_length=120)
+
+
+class UserLogin(BaseModel):
+    email: str = Field(..., min_length=5, max_length=255)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    email: Optional[str] = None
+    display_name: str
+    created_at: datetime
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user: UserOut
+
+
+# ---------------------------------------------------------------------------
 # Helpers: history normalisation + window trim
 # ---------------------------------------------------------------------------
 def _normalise_history(raw: Optional[list[Union[dict, HistoryMessage]]]) -> list[dict]:
@@ -699,20 +898,108 @@ def generate_reply_with_history(messages: list[dict], sentiment_label: str) -> t
         return lb.generate(messages, sentiment_label=sentiment_label), lb.name, lb.model_label
 
 
+def _stream_from(llm: BaseLLM, messages: list[dict], sentiment_label: str) -> Iterator[str]:
+    if isinstance(llm, LocalLLM):
+        yield from llm.stream(messages, sentiment_label=sentiment_label)
+    else:
+        yield from llm.stream(messages)
+
+
+def stream_reply_with_history(messages: list[dict], sentiment_label: str) -> Iterator[tuple[str, object]]:
+    """
+    Stream a reply, falling back to the next provider if one yields nothing.
+
+    Yields ("provider", {"name": ..., "model": ...}) exactly once, followed by
+    ("token", text) for every chunk. A provider that fails after tokens have
+    already been sent is not retried, because the client already received text.
+    """
+    primary = active_llm()
+    candidates = [primary] + [
+        _instantiated_llms[key]
+        for key in _FALLBACK_ORDER
+        if key in _instantiated_llms
+        and _instantiated_llms[key] is not primary
+        and _instantiated_llms[key].available
+    ]
+    for llm in candidates:
+        try:
+            stream = _stream_from(llm, messages, sentiment_label)
+            first = next(stream)
+        except StopIteration:
+            logger.warning(f"LLM '{llm.name}' streamed no tokens; trying next provider")
+            continue
+        except Exception as e:
+            logger.warning(f"LLM '{llm.name}' stream failed to start ({e}); trying next provider")
+            continue
+        yield "provider", {"name": llm.name, "model": llm.model_label}
+        yield "token", first
+        try:
+            for piece in stream:
+                yield "token", piece
+        except Exception as e:
+            logger.warning(f"LLM '{llm.name}' stream aborted mid-reply ({e})")
+        return
+
+    logger.warning("All streaming providers failed; using rule-based fallback")
+    fallback = LocalLLM()
+    yield "provider", {"name": fallback.name, "model": fallback.model_label}
+    for piece in _stream_from(fallback, messages, sentiment_label):
+        yield "token", piece
+
+
 # ---------------------------------------------------------------------------
 # DB helpers for chat persistence
 # ---------------------------------------------------------------------------
-def _resolve_session(db: SASession, session_id: Optional[str]) -> Optional[ChatSession]:
-    user = _get_or_create_default_user(db)
+def _resolve_session(
+    db: SASession,
+    session_id: Optional[str],
+    user_id: Optional[int],
+) -> Optional[ChatSession]:
     if session_id is None or session_id == "":
         return None
+    if user_id is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required to use a stored session",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     sess = db.query(ChatSession).filter(
         ChatSession.session_id == session_id,
-        ChatSession.user_id == user.id,
+        ChatSession.user_id == user_id,
     ).one_or_none()
     if sess is None:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
     return sess
+
+
+def _persist_turn(
+    db: SASession,
+    session: ChatSession,
+    user_text: str,
+    reply: str,
+    label: str,
+    confidence: float,
+    provider_name: str,
+    model_label: str,
+) -> None:
+    """Store both turns of an exchange and auto-title the session on its first turn."""
+    # Checked before adding, otherwise the relationship access below autoflushes
+    # the new messages and this session never looks like a first turn.
+    is_first_turn = (len(session.messages) == 0) and (session.title == "New chat")
+    db.add(ChatMessageDB(session_id=session.id, role="user", content=user_text))
+    db.add(ChatMessageDB(
+        session_id=session.id,
+        role="assistant",
+        content=reply,
+        sentiment_label=label,
+        sentiment_confidence=confidence,
+        llm_provider=provider_name,
+        llm_model=model_label,
+    ))
+    if is_first_turn:
+        session.title = user_text[:80].strip() or "New chat"
+    session.updated_at = utcnow()
+    db.commit()
 
 
 def _session_to_dto(s: ChatSession) -> SessionOut:
@@ -755,20 +1042,9 @@ def _startup() -> None:
 @app.get("/")
 def root(db: SASession = Depends(get_db)):
     llm = active_llm()
-    user = _get_or_create_default_user(db)
-    session_count = (
-        db.query(func.count(ChatSession.id))
-        .filter(ChatSession.user_id == user.id)
-        .scalar()
-        or 0
-    )
-    message_count = (
-        db.query(func.count(ChatMessageDB.id))
-        .join(ChatSession, ChatSession.id == ChatMessageDB.session_id)
-        .filter(ChatSession.user_id == user.id)
-        .scalar()
-        or 0
-    )
+    session_count = db.query(func.count(ChatSession.id)).scalar() or 0
+    message_count = db.query(func.count(ChatMessageDB.id)).scalar() or 0
+    user_count = db.query(func.count(User.id)).scalar() or 0
     return {
         "status": "AI Chat Backend is running",
         "llm": {
@@ -783,8 +1059,14 @@ def root(db: SASession = Depends(get_db)):
         },
         "database": {
             "url_scheme": DATABASE_URL.split("://")[0],
+            "users": user_count,
             "sessions": session_count,
             "messages": message_count,
+        },
+        "auth": {
+            "enabled": True,
+            "scheme": "bearer",
+            "token_ttl_minutes": JWT_EXPIRE_MINUTES,
         },
         "docs": "/docs",
     }
@@ -803,16 +1085,22 @@ def analyze_sentiment(request: ChatRequest):
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest, db: SASession = Depends(get_db)):
+def chat(
+    request: ChatRequest,
+    db: SASession = Depends(get_db),
+    user: Optional[User] = Depends(optional_user),
+):
     """
     1. Classifies sentiment on the latest user message
     2. Builds LLM history (explicit request.history > session history from DB > empty)
     3. Generates a reply via the active LLM (with provider fallback)
-    4. If session_id is provided, persists the user+assistant turns to the DB
+    4. If session_id is provided, persists the user+assistant turns (requires auth)
+
+    With no session_id the call is stateless and works without a token.
     """
     try:
         # --- Session / persistence prep
-        session = _resolve_session(db, request.session_id)
+        session = _resolve_session(db, request.session_id, user.id if user else None)
         db_history: list[dict] | None = None
         if session is not None and request.history is None:
             db_history = [
@@ -828,26 +1116,7 @@ def chat(request: ChatRequest, db: SASession = Depends(get_db)):
         # --- Persist
         out_session_id: Optional[str] = None
         if session is not None:
-            user_msg = ChatMessageDB(
-                session_id=session.id,
-                role="user",
-                content=request.message,
-            )
-            ai_msg = ChatMessageDB(
-                session_id=session.id,
-                role="assistant",
-                content=reply,
-                sentiment_label=label,
-                sentiment_confidence=confidence,
-                llm_provider=provider_name,
-                llm_model=model_label,
-            )
-            db.add_all([user_msg, ai_msg])
-            # Auto-title first turn from the user message
-            if (len(session.messages) == 0) and (session.title == "New chat"):
-                session.title = request.message[:80].strip() or "New chat"
-            session.updated_at = utcnow()
-            db.commit()
+            _persist_turn(db, session, request.message, reply, label, confidence, provider_name, model_label)
             out_session_id = session.session_id
 
         return ChatResponse(
@@ -865,12 +1134,155 @@ def chat(request: ChatRequest, db: SASession = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Chat error: {e}")
 
 
+def _sse(payload: dict) -> str:
+    """Encode one Server-Sent Events message."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@app.post("/chat/stream")
+def chat_stream(
+    request: ChatRequest,
+    db: SASession = Depends(get_db),
+    session_factory=Depends(get_db_factory),
+    user: Optional[User] = Depends(optional_user),
+):
+    """
+    Same behaviour as POST /chat, but streams the reply as Server-Sent Events.
+
+    Event payloads (each is a `data: <json>\\n\\n` line):
+      {"type": "meta",     "sentiment", "confidence", "session_id"}
+      {"type": "provider", "provider", "model"}
+      {"type": "token",    "text"}
+      {"type": "done",     "reply", "provider", "model", "session_id"}
+      {"type": "error",    "detail"}
+    """
+    # Captured before streaming: the ORM object dies with the request-scoped session.
+    user_id = user.id if user else None
+    # Validated up front so a bad session_id still returns a real 404.
+    session = _resolve_session(db, request.session_id, user_id)
+    db_history: list[dict] | None = None
+    if session is not None and request.history is None:
+        db_history = [{"role": m.role, "content": m.content} for m in session.messages]
+
+    label, confidence = classify_sentiment(request.message)
+    llm_messages = build_messages_for_llm(request, db_history=db_history)
+    out_session_id: Optional[str] = session.session_id if session is not None else None
+
+    def event_stream() -> Iterator[str]:
+        chunks: list[str] = []
+        provider_name = ""
+        model_label = ""
+        try:
+            yield _sse({
+                "type": "meta",
+                "sentiment": label,
+                "confidence": confidence,
+                "session_id": out_session_id,
+            })
+            for kind, payload in stream_reply_with_history(llm_messages, label):
+                if kind == "provider":
+                    provider_name = payload["name"]
+                    model_label = payload["model"]
+                    yield _sse({"type": "provider", "provider": provider_name, "model": model_label})
+                else:
+                    chunks.append(payload)
+                    yield _sse({"type": "token", "text": payload})
+
+            reply = "".join(chunks).strip()
+            if not reply:
+                raise RuntimeError("Empty reply from all LLM providers")
+
+            if out_session_id:
+                with session_factory() as sdb:
+                    target = _resolve_session(sdb, out_session_id, user_id)
+                    if target is not None:
+                        _persist_turn(
+                            sdb,
+                            target,
+                            request.message,
+                            reply,
+                            label,
+                            confidence,
+                            provider_name,
+                            model_label,
+                        )
+
+            yield _sse({
+                "type": "done",
+                "reply": reply,
+                "provider": provider_name,
+                "model": model_label,
+                "session_id": out_session_id,
+            })
+        except Exception as e:
+            logger.exception("Chat stream failed")
+            yield _sse({"type": "error", "detail": f"Chat stream error: {e}"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Auth REST
+# ---------------------------------------------------------------------------
+@app.post("/auth/register", response_model=TokenResponse, status_code=201)
+def register(body: UserRegister, db: SASession = Depends(get_db)):
+    """Create an account and return a bearer token."""
+    email = body.email.strip().lower()
+    if not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=422, detail="Enter a valid email address")
+
+    exists = db.query(User).filter(User.email == email).one_or_none()
+    if exists is not None:
+        raise HTTPException(status_code=409, detail="An account with that email already exists")
+
+    user = User(
+        external_id=f"user_{uuid.uuid4().hex[:12]}",
+        email=email,
+        password_hash=hash_password(body.password),
+        display_name=(body.display_name or email.split("@")[0])[:120],
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    token, expires_in = create_access_token(user)
+    return TokenResponse(access_token=token, expires_in=expires_in, user=UserOut.model_validate(user))
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+def login(body: UserLogin, db: SASession = Depends(get_db)):
+    """Exchange email + password for a bearer token."""
+    email = body.email.strip().lower()
+    user = db.query(User).filter(User.email == email).one_or_none()
+    if user is None or not verify_password(body.password, user.password_hash):
+        # Same message either way so the endpoint doesn't reveal which emails exist.
+        raise HTTPException(status_code=401, detail="Incorrect email or password",
+                            headers={"WWW-Authenticate": "Bearer"})
+
+    token, expires_in = create_access_token(user)
+    return TokenResponse(access_token=token, expires_in=expires_in, user=UserOut.model_validate(user))
+
+
+@app.get("/auth/me", response_model=UserOut)
+def me(user: User = Depends(current_user)):
+    """Return the signed-in account."""
+    return UserOut.model_validate(user)
+
+
 # ---------------------------------------------------------------------------
 # Sessions REST
 # ---------------------------------------------------------------------------
 @app.post("/sessions", response_model=SessionOut, status_code=201)
-def create_session(body: SessionCreate, db: SASession = Depends(get_db)):
-    user = _get_or_create_default_user(db)
+def create_session(body: SessionCreate, db: SASession = Depends(get_db),
+                    user: User = Depends(current_user)):
     sess = ChatSession(
         user_id=user.id,
         title=(body.title or "New chat").strip()[:160] or "New chat",
@@ -885,8 +1297,8 @@ def create_session(body: SessionCreate, db: SASession = Depends(get_db)):
 def list_sessions(
     limit: int = Query(default=50, ge=1, le=200),
     db: SASession = Depends(get_db),
+    user: User = Depends(current_user),
 ):
-    user = _get_or_create_default_user(db)
     rows = (
         db.query(ChatSession)
         .filter(ChatSession.user_id == user.id)
@@ -898,8 +1310,8 @@ def list_sessions(
 
 
 @app.get("/sessions/{session_id}", response_model=SessionDetail)
-def get_session(session_id: str, db: SASession = Depends(get_db)):
-    user = _get_or_create_default_user(db)
+def get_session(session_id: str, db: SASession = Depends(get_db),
+                user: User = Depends(current_user)):
     s = db.query(ChatSession).filter(
         ChatSession.session_id == session_id,
         ChatSession.user_id == user.id,
@@ -917,8 +1329,8 @@ def get_session(session_id: str, db: SASession = Depends(get_db)):
 
 
 @app.get("/sessions/{session_id}/messages", response_model=list[MessageOut])
-def get_session_messages(session_id: str, db: SASession = Depends(get_db)):
-    user = _get_or_create_default_user(db)
+def get_session_messages(session_id: str, db: SASession = Depends(get_db),
+                         user: User = Depends(current_user)):
     s = db.query(ChatSession).filter(
         ChatSession.session_id == session_id,
         ChatSession.user_id == user.id,
@@ -941,8 +1353,8 @@ def get_session_messages(session_id: str, db: SASession = Depends(get_db)):
 
 
 @app.patch("/sessions/{session_id}", response_model=SessionOut)
-def update_session(session_id: str, body: SessionUpdate, db: SASession = Depends(get_db)):
-    user = _get_or_create_default_user(db)
+def update_session(session_id: str, body: SessionUpdate, db: SASession = Depends(get_db),
+                   user: User = Depends(current_user)):
     s = db.query(ChatSession).filter(
         ChatSession.session_id == session_id,
         ChatSession.user_id == user.id,
@@ -957,8 +1369,8 @@ def update_session(session_id: str, body: SessionUpdate, db: SASession = Depends
 
 
 @app.delete("/sessions/{session_id}", status_code=204)
-def delete_session(session_id: str, db: SASession = Depends(get_db)):
-    user = _get_or_create_default_user(db)
+def delete_session(session_id: str, db: SASession = Depends(get_db),
+                   user: User = Depends(current_user)):
     s = db.query(ChatSession).filter(
         ChatSession.session_id == session_id,
         ChatSession.user_id == user.id,
