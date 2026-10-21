@@ -119,20 +119,20 @@ flutter run
 
 ## ✅ Verification Status
 
-- [x] 80/80 backend tests pass
+- [x] 80/80 backend tests pass (Python 3.9.13 and 3.12.10)
 - [x] `flutter analyze` reports no issues
 - [x] `flutter test` passes
 - [x] Streaming verified end-to-end against a live `uvicorn` + `curl -N`
 - [x] Alembic migrations applied to the local database
+- [x] "Tests & Quality" CI green — 6/6 jobs on `main`: backend-tests (3.9, 3.11), backend-lint, evaluator-tests, docker-build, security
 
 ## ⚠️ Not Yet Done
 
 | Item | Blocker |
 |---|---|
 | Production migration | `alembic upgrade head` must be run against the Render Postgres `DATABASE_URL` — `0002` adds the auth columns the new code queries |
-| Docker Compose stack | Docker Desktop is not installed on the dev machine, so the compose path and the CI Docker build are unverified locally |
+| Docker Compose stack | Docker Desktop is not installed on the dev machine, so the compose path is unverified locally (the CI `docker-build` job does build both images successfully) |
 | Running the app on a device | Requires Developer Mode on Windows (plugin symlinks); only static analysis has been run |
-| Custom branding | Not started |
 
 ## 🎯 Interview Talking Points
 
